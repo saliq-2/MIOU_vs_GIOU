@@ -1,0 +1,258 @@
+import os
+import yaml
+import torch
+import torchvision
+import csv
+from ultralytics import YOLO
+from tqdm import tqdm
+"""
+
+For finding the best confidence and IoU thresholds for object detection
+
+"""
+# --- Configuration ---
+MODEL_PATH = ""
+DATA_YAML  = ""  #yaml contains path to txt, which contains which images to process
+SAVE_DIR   = ""
+
+# The Grid to search
+CONF_RANGE = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8]
+IOU_RANGE  = [0.3, 0.4, 0.5, 0.6, 0.7] 
+
+def xywhn2xyxy(x, w, h):
+    """Converts normalized xywh to pixel xyxy format."""
+    if len(x) == 0:
+        return torch.Tensor([])
+    y = x.clone() if isinstance(x, torch.Tensor) else torch.tensor(x)
+    y[:, 1] = (x[:, 1] - x[:, 3] / 2) * w
+    y[:, 2] = (x[:, 2] - x[:, 4] / 2) * h
+    y[:, 3] = (x[:, 1] + x[:, 3] / 2) * w
+    y[:, 4] = (x[:, 2] + x[:, 4] / 2) * h
+    return y
+
+def get_image_list(yaml_path):
+    with open(yaml_path, 'r') as f:
+        data_cfg = yaml.safe_load(f)
+    
+    root_path = data_cfg.get('path', '')
+    test_file_rel = data_cfg.get('test')
+    
+    if os.path.isabs(test_file_rel):
+        test_list_path = test_file_rel
+    else:
+        test_list_path = os.path.join(root_path, test_file_rel)
+
+    with open(test_list_path, 'r') as f:
+        img_lines = [x.strip() for x in f.readlines() if x.strip()]
+
+    full_img_paths = []
+    for line in img_lines:
+        if line.startswith('/'):
+            full_img_paths.append(line)
+        else:
+            full_img_paths.append(os.path.join(root_path, line))
+            
+    return full_img_paths, data_cfg.get('names', {})
+
+def calculate_metrics(pred_boxes, pred_cls, pred_conf, gt_boxes, gt_cls, iou_thresh):
+    tp = 0
+    fp = 0
+    n_gt = len(gt_boxes)
+    
+    if len(pred_boxes) == 0:
+        return 0, 0, n_gt
+
+    if len(gt_boxes) == 0:
+        return 0, len(pred_boxes), 0
+
+    iou_matrix = torchvision.ops.box_iou(pred_boxes, gt_boxes)
+    matched_gt = set()
+    
+
+    sorted_indices = torch.argsort(pred_conf, descending=True)
+    
+    for p_idx in sorted_indices:
+        ious = iou_matrix[p_idx]
+        best_iou, best_gt_idx = torch.max(ious, dim=0)
+        best_iou = best_iou.item()
+        best_gt_idx = best_gt_idx.item()
+        
+        if best_iou >= iou_thresh:
+            if pred_cls[p_idx] == gt_cls[best_gt_idx]:
+                if best_gt_idx not in matched_gt:
+                    tp += 1
+                    matched_gt.add(best_gt_idx)
+                else:
+                    fp += 1
+            else:
+                fp += 1
+        else:
+            fp += 1
+            
+    fn = n_gt - len(matched_gt)
+    return tp, fp, fn
+
+def main():
+    if not os.path.exists(SAVE_DIR):
+        os.makedirs(SAVE_DIR)
+
+    # 1. Load Model
+    model = YOLO(MODEL_PATH)
+    image_files, class_names = get_image_list(DATA_YAML)
+    
+    # 2. Cache Predictions
+    print("--- Step 1: Caching Predictions (Inference) ---")
+    cache_data = []
+    MIN_INFERENCE_CONF = 0.001 
+    
+    for img_path in tqdm(image_files, desc="Inference"):
+        if not os.path.exists(img_path):
+            continue
+
+        results = model.predict(img_path, conf=MIN_INFERENCE_CONF, verbose=False)[0]
+        h, w = results.orig_shape
+
+        preds = {
+            'boxes': results.boxes.xyxy.cpu(),
+            'conf': results.boxes.conf.cpu(),
+            'cls': results.boxes.cls.cpu()
+        }
+
+        label_path = img_path.rsplit('.', 1)[0] + '.txt'
+        label_path = label_path.replace('/images/', '/labels/')
+        
+        gt = {'boxes': torch.Tensor([]), 'cls': torch.Tensor([])}
+        
+        if os.path.exists(label_path):
+            try:
+                with open(label_path, 'r') as lf:
+                    lines = [list(map(float, line.strip().split())) for line in lf.readlines() if line.strip()]
+                if lines:
+                    t_lines = torch.tensor(lines)
+                    gt['cls'] = t_lines[:, 0]
+                    gt['boxes'] = xywhn2xyxy(t_lines, w, h)[:, 1:]
+            except:
+                pass
+
+        cache_data.append({'preds': preds, 'gt': gt})
+
+  
+    print("\n--- Step 2: Running Grid Search ---")
+    
+    grid_results = []
+    
+    # --- FIX: Handle both List and Dictionary for class_names ---
+    if isinstance(class_names, list):
+        unique_classes = list(range(len(class_names)))
+    else:
+        unique_classes = sorted(list(class_names.keys()))
+    
+
+    pbar = tqdm(total=len(IOU_RANGE) * len(CONF_RANGE), desc="Optimizing")
+
+    for test_iou in IOU_RANGE:
+        for test_conf in CONF_RANGE:
+            
+            class_stats = {c: {'tp': 0, 'fp': 0, 'fn': 0} for c in unique_classes}
+            
+            for data in cache_data:
+                p_boxes = data['preds']['boxes']
+                p_conf = data['preds']['conf']
+                p_cls = data['preds']['cls']
+                
+                g_boxes = data['gt']['boxes']
+                g_cls = data['gt']['cls']
+                
+                # Filter by Confidence
+                mask = p_conf >= test_conf
+                f_boxes = p_boxes[mask]
+                f_cls = p_cls[mask]
+                f_conf = p_conf[mask]
+                
+                for cls_id in unique_classes:
+                    cls_mask_p = (f_cls == cls_id)
+                    cp_boxes = f_boxes[cls_mask_p]
+                    cp_conf = f_conf[cls_mask_p]
+                    cp_cls_arr = f_cls[cls_mask_p]
+                    
+                    cls_mask_g = (g_cls == cls_id)
+                    cg_boxes = g_boxes[cls_mask_g]
+                    cg_cls_arr = g_cls[cls_mask_g]
+                    
+                    tp, fp, fn = calculate_metrics(cp_boxes, cp_cls_arr, cp_conf, cg_boxes, cg_cls_arr, test_iou)
+                    
+                    class_stats[cls_id]['tp'] += tp
+                    class_stats[cls_id]['fp'] += fp
+                    class_stats[cls_id]['fn'] += fn
+            
+            for cls_id, stats in class_stats.items():
+                tp = stats['tp']
+                fp = stats['fp']
+                fn = stats['fn']
+                
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                
+                grid_results.append({
+                    'Class_ID': cls_id,
+                    'Class_Name': class_names[cls_id],
+                    'IoU_Thresh': test_iou,
+                    'Conf_Thresh': test_conf,
+                    'Precision': precision,
+                    'Recall': recall,
+                    'F1_Score': f1
+                })
+            
+            pbar.update(1)
+    pbar.close()
+
+    # 4. Save Results
+    full_csv_path = os.path.join(SAVE_DIR, "grid_search_full.csv")
+    if grid_results:
+        keys = grid_results[0].keys()
+        with open(full_csv_path, 'w', newline='') as f:
+            dict_writer = csv.DictWriter(f, fieldnames=keys)
+            dict_writer.writeheader()
+            dict_writer.writerows(grid_results)
+
+    print(f"\nFull grid results saved to: {full_csv_path}")
+    print("\n=== OPTIMAL THRESHOLDS (Max F1 Score) ===")
+    
+    if not grid_results:
+        print("No results found.")
+        return
+
+    # Logic to find Best F1 per Class + IoU
+    best_metrics = {} 
+
+    for res in grid_results:
+        key = (res['Class_Name'], res['IoU_Thresh'])
+        current_f1 = res['F1_Score']
+        
+        if key not in best_metrics:
+            best_metrics[key] = res
+        else:
+            if current_f1 > best_metrics[key]['F1_Score']:
+                best_metrics[key] = res
+
+    sorted_best = sorted(best_metrics.values(), key=lambda x: (x['Class_ID'], x['IoU_Thresh']))
+    
+    # Print Table Header
+    print(f"{'Class_Name':<20} {'IoU':<6} {'Conf':<6} {'F1':<6} {'Prec':<6} {'Rec':<6}")
+    print("-" * 60)
+    
+    for res in sorted_best:
+        print(f"{res['Class_Name']:<20} {res['IoU_Thresh']:<6} {res['Conf_Thresh']:<6} {res['F1_Score']:.2f}   {res['Precision']:.2f}   {res['Recall']:.2f}")
+
+   
+    best_csv_path = os.path.join(SAVE_DIR, "best_thresholds.csv")
+    with open(best_csv_path, 'w', newline='') as f:
+        dict_writer = csv.DictWriter(f, fieldnames=keys)
+        dict_writer.writeheader()
+        dict_writer.writerows(sorted_best)
+        
+    print(f"\nSaved optimal thresholds to: {best_csv_path}")
+
+if __name__ == "__main__":
+    main()
