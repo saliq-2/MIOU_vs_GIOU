@@ -2,7 +2,7 @@
 
 
 
-Model IOU Vs Ground truth IOU
+Model Preds Vs Ground truth Preds
 
 
 
